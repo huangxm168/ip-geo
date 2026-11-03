@@ -1,0 +1,68 @@
+name: Release
+
+# 推 vX.Y.Z 标签：核对版本 → 全部检查 → 发布到 npm（可信发布，不存任何令牌）→ 建 GitHub Release
+# ⚠️ 可信发布只能给已经存在的包配置：0.1.0 由作者手动发布，之后在 npm 包设置里登记本仓库的这个工作流
+on:
+  push:
+    tags: ["v*.*.*"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # 建 GitHub Release
+  id-token: write # npm 可信发布（OIDC）
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          # 自带的 npm 满足可信发布要求的 11.5.1 以上
+          node-version-file: .nvmrc
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: 核对标签与 package.json 的版本一致
+        run: |
+          expected="v$(node -p 'require("./package.json").version')"
+          if [ "$expected" != "$GITHUB_REF_NAME" ]; then
+            echo "标签 $GITHUB_REF_NAME 与 package.json 的 $expected 不一致"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - uses: actions/cache@v6
+        with:
+          path: test/.data/ip2region
+          key: ip2region-${{ hashFiles('data/ip2region.json') }}
+
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run check:pack
+
+      # 这个版本已在 npm 上时跳过（0.1.0 是作者手动发布的；Release 那一步失败后重跑也不会撞上「版本已存在」）
+      - name: 发布到 npm（可信发布会自动附上来源证明）
+        run: |
+          spec="$(node -p 'const p = require("./package.json"); `${p.name}@${p.version}`')"
+          if npm view "$spec" version >/dev/null 2>&1; then
+            echo "$spec 已在 npm 上，跳过发布"
+          else
+            npm publish --access public
+          fi
+
+      - name: 建 GitHub Release（正文取标签指向的那次提交的完整说明）
+        run: |
+          git log -1 --format=%B "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+        env:
+          GH_TOKEN: ${{ github.token }}

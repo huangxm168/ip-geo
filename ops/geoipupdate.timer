@@ -1,0 +1,14 @@
+# 每周三、周六各更新一次 MaxMind GeoLite 数据库
+# 安装与说明见 docs/operations.md
+[Unit]
+Description=定时更新 MaxMind GeoLite 数据库（ip-geo）
+
+[Timer]
+# MaxMind 每周二、周五发布新版，排在之后一天的北京时间 04:00，再随机延后最多 1 小时
+OnCalendar=Wed,Sat *-*-* 04:00:00 Asia/Shanghai
+RandomizedDelaySec=1h
+# 机器停机错过的那一次，开机后补跑
+Persistent=true
+
+[Install]
+WantedBy=timers.target

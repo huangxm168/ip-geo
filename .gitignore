@@ -1,0 +1,13 @@
+node_modules
+dist
+coverage
+*.tgz
+# 测试用的 ip2region 数据文件，按 data/ip2region.json 取用
+test/.data
+# MaxMind 的数据文件不得进仓库（GeoLite 条款）；官方测试库在 test/fixtures/maxmind，不受此限
+*.mmdb
+!test/fixtures/maxmind/*.mmdb
+*.xdb
+
+# 只与本机有关的说明（Claude Code 自动读取）
+CLAUDE.local.md

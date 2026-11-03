@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 最低支持的 22 与开发用的 24 各跑一遍
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # ip2region 数据文件（约 11MB）按清单取用，清单不变就不重新下载
+      - uses: actions/cache@v6
+        with:
+          path: test/.data/ip2region
+          key: ip2region-${{ hashFiles('data/ip2region.json') }}
+
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run check:pack

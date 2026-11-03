@@ -1,0 +1,12 @@
+# geoipupdate 的配置，放到 /etc/GeoIP.conf（含凭据：属主 root、权限 600）
+# 说明见 docs/operations.md
+
+# MaxMind 账户后台「Manage License Keys」里的账户 ID 与许可密钥
+AccountID <账户 ID>
+LicenseKey <许可密钥>
+
+# 免费账户能下的只有 City / Country / ASN 三个库，本包用 City 与 ASN
+EditionIDs GeoLite2-City GeoLite2-ASN
+
+# 按机器、不按网站：同一台机器上的几个网站共读这一份
+DatabaseDirectory /var/lib/GeoIP
