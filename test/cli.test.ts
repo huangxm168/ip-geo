@@ -29,6 +29,8 @@ describe("ip-geo doctor", () => {
       IP2REGION_DIR,
       "--maxmind",
       maxmindDir(),
+      "--warn-days",
+      "100000",
       "--max-age-days",
       "100000",
       "--ip",
@@ -37,19 +39,34 @@ describe("ip-geo doctor", () => {
     expect(code).toBe(0);
     expect(output).toContain("✓ ip2region");
     expect(output).toContain("✓ MaxMind City：GeoLite2-City");
-    expect(output).toContain('"city":"伦敦"');
+    expect(output).toContain('"city":"London"');
   });
 
-  it("MaxMind 过久没更新：提示但以 0 退出", () => {
+  it("MaxMind 超过提示天数：提示但以 0 退出", () => {
+    const { code, output } = run([
+      "doctor",
+      "--maxmind",
+      maxmindDir(),
+      "--warn-days",
+      "0",
+      "--max-age-days",
+      "100000",
+    ]);
+    expect(code).toBe(0);
+    expect(output).toContain("⚠️ MaxMind City");
+    expect(output).toContain("检查定时更新");
+  });
+
+  it("MaxMind 超过停用上限：以 1 退出", () => {
     const { code, output } = run([
       "doctor",
       "--maxmind",
       maxmindDir(),
       "--max-age-days",
-      "0",
+      "1",
     ]);
-    expect(code).toBe(0);
-    expect(output).toContain("检查定时更新");
+    expect(code).toBe(1);
+    expect(output).toContain("解析器已停用它");
   });
 
   it("文件缺失：以 1 退出", () => {

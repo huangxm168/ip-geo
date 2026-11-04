@@ -5,7 +5,21 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  # 工作流自身的检查（actionlint ＋ zizmor），与本地 npm run lint:workflows 同一份脚本
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash scripts/lint-workflows.sh
+        env:
+          GH_TOKEN: ${{ github.token }} # 只读，供 zizmor 的联网审计
+
   check:
     runs-on: ubuntu-latest
     strategy:
@@ -14,9 +28,11 @@ jobs:
         # 最低支持的 22 与开发用的 24 各跑一遍
         node: [22, 24]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -24,7 +40,7 @@ jobs:
       - run: npm ci
 
       # ip2region 数据文件（约 11MB）按清单取用，清单不变就不重新下载
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: test/.data/ip2region
           key: ip2region-${{ hashFiles('data/ip2region.json') }}

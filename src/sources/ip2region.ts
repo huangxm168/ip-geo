@@ -45,6 +45,11 @@ export class Ip2regionSource {
     return parseRecord(raw);
   }
 
+  /** 没加载就加载（失败后隔一个检查间隔才再试）；返回此刻是否可用 */
+  ensureLoaded(): boolean {
+    return this.#load() !== null;
+  }
+
   get version(): string | null {
     return this.#loaded?.version ?? null;
   }

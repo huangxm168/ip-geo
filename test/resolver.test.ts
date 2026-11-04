@@ -7,9 +7,10 @@
 
 import { copyFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createGeoResolver } from "../src/index.js";
+import { createGeoResolver, type GeoResolver } from "../src/index.js";
+import { MaxmindSource } from "../src/sources/maxmind.js";
 import {
   ASN_FIXTURE,
   CITY_FIXTURE_GEOIP2,
@@ -22,7 +23,12 @@ import {
 const FIXTURE_VERSION = "GeoLite2@City-20261022";
 const FIXTURE_ASN = "ASN-20261022";
 
-function resolver(dir: string | null, recheckIntervalMs = 0) {
+// 官方测试库的构建日期是固定的，会一天天变旧：除了专测过期的用例，一律不设上限
+function resolver(
+  dir: string | null,
+  recheckIntervalMs = 0,
+  maxDataAgeDays: number | null = null
+) {
   const logger = recordingLogger();
   return {
     logger,
@@ -30,9 +36,22 @@ function resolver(dir: string | null, recheckIntervalMs = 0) {
       ip2regionDir: IP2REGION_DIR,
       maxmindDir: dir,
       recheckIntervalMs,
+      maxDataAgeDays,
       logger,
     }),
   };
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+// 某个库不可用的原因；可用或没开 MaxMind 时为空串
+function reasonOf(geo: GeoResolver, edition: "city" | "asn"): string {
+  const maxmind = geo.status().maxmind;
+  if (maxmind.state !== "enabled") return "";
+  const file = maxmind[edition];
+  return file.state === "unavailable" ? file.reason : "";
 }
 
 // 像 geoipupdate 那样先写临时文件再改名
@@ -52,14 +71,14 @@ describe("真实地址", () => {
     });
   });
 
-  it("海外国家一致：取 MaxMind 的州与城市（中文优先）", async () => {
+  it("海外：MaxMind 有地点，取它的州与城市（英文名，库里有中文名也不用）", async () => {
     const { geo } = resolver(maxmindDir());
     const result = await geo.lookup("81.2.69.142");
     expect(result).toMatchObject({
       countryCode: "GB",
       countryName: "英国",
-      region: "英格兰",
-      city: "伦敦",
+      region: "England",
+      city: "London",
       source: "maxmind",
     });
     expect(result.version).toMatch(
@@ -67,20 +86,20 @@ describe("真实地址", () => {
     );
   });
 
-  it("运营商取 ASN；没有中文名的州用英文", async () => {
+  it("运营商取 ASN", async () => {
     const { geo } = resolver(maxmindDir());
     const result = await geo.lookup("89.160.20.112");
     expect(result).toMatchObject({
       countryCode: "SE",
       region: "Östergötland County",
-      city: "林雪平",
+      city: "Linköping",
       isp: "Bredband2 AB",
       source: "maxmind",
     });
     expect(result.version).toContain(`${FIXTURE_VERSION}+${FIXTURE_ASN}`);
   });
 
-  it("国家不一致（ip2region 美国、测试库不丹）：保留粗结果", async () => {
+  it("MaxMind 只有国家（测试库是不丹、ip2region 是美国）：地点整套取 ip2region", async () => {
     const { geo } = resolver(maxmindDir());
     expect(await geo.lookup("67.43.156.1")).toMatchObject({
       countryCode: "US",
@@ -88,6 +107,7 @@ describe("真实地址", () => {
       city: "Honolulu",
       source: "ip2region",
     });
+    expect((await geo.lookup("67.43.156.1")).version).not.toContain("City");
   });
 
   it("MaxMind 只有运营商：地点保留 ip2region，运营商取 ASN", async () => {
@@ -126,31 +146,180 @@ describe("MaxMind 的状态与降级", () => {
     await geo.lookup("81.2.69.142");
     await geo.lookup("89.160.20.112");
     expect((await geo.lookup("81.2.69.142")).source).toBe("ip2region-fallback");
-    const status = geo.status().maxmind;
-    expect(status.state).toBe("unavailable");
+    expect(geo.status().maxmind).toMatchObject({
+      state: "enabled",
+      city: { state: "unavailable" },
+      asn: { state: "unavailable" },
+    });
+    expect(reasonOf(geo, "city")).toContain("不存在");
     expect(logger.lines.filter((line) => line.level === "warn")).toHaveLength(
       1
     );
   });
 
-  it("文件类型不对（City 的位置放了 ASN 库）：不可用", async () => {
+  it("文件类型不对（City 的位置放了 ASN 库）：City 不可用，ASN 照常", async () => {
     const dir = maxmindDir();
     copyFileSync(ASN_FIXTURE, join(dir, "GeoLite2-City.mmdb"));
     const { geo } = resolver(dir);
-    expect((await geo.lookup("81.2.69.142")).source).toBe("ip2region-fallback");
+    expect(await geo.lookup("89.160.20.112")).toMatchObject({
+      source: "ip2region-fallback",
+      isp: "Bredband2 AB",
+    });
     const status = geo.status().maxmind;
-    expect(status.state === "unavailable" && status.reason).toContain(
-      "不是 City 库"
-    );
+    expect(status).toMatchObject({
+      city: { state: "unavailable" },
+      asn: { state: "ready" },
+    });
+    expect(reasonOf(geo, "city")).toContain("不是 City 库");
+  });
+
+  it("只缺 City：地点记降级，ASN 照样补运营商", async () => {
+    const dir = maxmindDir();
+    rmSync(join(dir, "GeoLite2-City.mmdb"));
+    const { geo, logger } = resolver(dir);
+    const result = await geo.lookup("1.128.0.1");
+    expect(result).toMatchObject({
+      source: "ip2region-fallback",
+      isp: "Telstra Pty Ltd",
+    });
+    expect(result.version).toContain("GeoLite2@ASN-");
+    expect(
+      logger.lines.some(
+        (line) =>
+          line.level === "warn" && line.message.includes("日后可以补解析")
+      )
+    ).toBe(true);
+  });
+
+  it("只缺 ASN：地点照常取 MaxMind", async () => {
+    const dir = maxmindDir();
+    rmSync(join(dir, "GeoLite2-ASN.mmdb"));
+    const { geo } = resolver(dir);
+    expect(await geo.lookup("89.160.20.112")).toMatchObject({
+      source: "maxmind",
+      city: "Linköping",
+      isp: null,
+    });
+    expect(geo.status().maxmind).toMatchObject({
+      city: { state: "ready" },
+      asn: { state: "unavailable" },
+    });
   });
 
   it("就绪时状态给出两个库的类型与构建日期", async () => {
     const { geo } = resolver(maxmindDir());
     await geo.lookup("81.2.69.142");
     expect(geo.status().maxmind).toMatchObject({
-      state: "ready",
-      city: { databaseType: "GeoLite2-City", buildDate: "2026-10-22" },
-      asn: { databaseType: "GeoLite2-ASN", buildDate: "2026-10-22" },
+      state: "enabled",
+      city: {
+        state: "ready",
+        databaseType: "GeoLite2-City",
+        buildDate: "2026-10-22",
+      },
+      asn: {
+        state: "ready",
+        databaseType: "GeoLite2-ASN",
+        buildDate: "2026-10-22",
+      },
+    });
+  });
+
+  it("MaxMind 那一段出了意外：按不可用处理，记降级而不是空", async () => {
+    vi.spyOn(MaxmindSource.prototype, "current").mockRejectedValue(
+      new Error("模拟的意外")
+    );
+    const { geo, logger } = resolver(maxmindDir());
+    expect(await geo.lookup("81.2.69.142")).toMatchObject({
+      countryCode: "GB",
+      source: "ip2region-fallback",
+    });
+    expect(
+      logger.lines.some(
+        (line) => line.level === "error" && line.message.includes("模拟的意外")
+      )
+    ).toBe(true);
+  });
+});
+
+describe("过期停用", () => {
+  it("构建日期超过上限：两个库都停用，记降级，报一条错误", async () => {
+    const { geo, logger } = resolver(maxmindDir(), 0, 1);
+    expect(await geo.lookup("89.160.20.112")).toMatchObject({
+      source: "ip2region-fallback",
+      isp: null,
+    });
+    await geo.lookup("81.2.69.142");
+    expect(geo.status().maxmind).toMatchObject({
+      city: { state: "unavailable" },
+      asn: { state: "unavailable" },
+    });
+    expect(reasonOf(geo, "city")).toContain("已停用");
+    expect(reasonOf(geo, "asn")).toContain("已停用");
+    // 同一天里反复检查只报一次
+    expect(logger.lines.filter((line) => line.level === "error")).toHaveLength(
+      1
+    );
+  });
+
+  it("已停用的文件没换就不重读；换成新版后恢复", async () => {
+    // 只假造「今天」：测试库构建于 2026-10-22，上限 1 天
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const dir = maxmindDir();
+      const cityPath = join(dir, "GeoLite2-City.mmdb");
+      const { geo } = resolver(dir, 0, 1);
+      vi.setSystemTime(new Date("2026-10-22T12:00:00Z"));
+      expect((await geo.lookup("81.2.69.142")).source).toBe("maxmind");
+
+      vi.setSystemTime(new Date("2026-10-25T12:00:00Z"));
+      expect((await geo.lookup("81.2.69.142")).source).toBe(
+        "ip2region-fallback"
+      );
+      // 文件被改坏但签名没变（同一份）：照样只是停用，不去读它
+      expect(reasonOf(geo, "city")).toContain("已停用");
+
+      // 新版到了（换文件、签名变了，且构建日期在上限内）
+      vi.setSystemTime(new Date("2026-10-22T18:00:00Z"));
+      copyFileSync(CITY_FIXTURE_GEOIP2, `${cityPath}.new`);
+      renameSync(`${cityPath}.new`, cityPath);
+      expect((await geo.lookup("81.2.69.142")).source).toBe("maxmind");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("上限设为 null 或 0：不停用", async () => {
+    for (const limit of [null, 0]) {
+      const { geo } = resolver(maxmindDir(), 0, limit);
+      expect((await geo.lookup("81.2.69.142")).source).toBe("maxmind");
+    }
+  });
+});
+
+describe("ready()", () => {
+  it("加载两类数据并返回状态，之后的查询不必再等加载", async () => {
+    const { geo, logger } = resolver(maxmindDir(), 60 * 60 * 1000);
+    const status = await geo.ready();
+    expect(status.ip2region?.version).toMatch(/^ip2region@/);
+    expect(status.maxmind).toMatchObject({
+      city: { state: "ready" },
+      asn: { state: "ready" },
+    });
+    const loaded = logger.lines.length;
+    await geo.lookup("81.2.69.142");
+    expect(logger.lines).toHaveLength(loaded);
+  });
+
+  it("数据缺失时照常返回状态，不抛错", async () => {
+    const geo = createGeoResolver({
+      ip2regionDir: tempDir(),
+      maxmindDir: tempDir(),
+      logger: recordingLogger(),
+    });
+    const status = await geo.ready();
+    expect(status.ip2region).toBeNull();
+    expect(status.maxmind).toMatchObject({
+      city: { state: "unavailable" },
     });
   });
 });
@@ -168,8 +337,7 @@ describe("重载", () => {
     const result = await geo.lookup("81.2.69.142");
     expect(result.version).toContain("GeoIP2@City-");
     expect(geo.status().maxmind).toMatchObject({
-      state: "ready",
-      city: { databaseType: "GeoIP2-City" },
+      city: { state: "ready", databaseType: "GeoIP2-City" },
     });
   });
 
@@ -211,7 +379,9 @@ describe("重载", () => {
     );
     expect(results.every((result) => result.source === "maxmind")).toBe(true);
     expect(
-      logger.lines.filter((line) => line.message.startsWith("MaxMind 可用"))
+      logger.lines.filter((line) =>
+        line.message.startsWith("MaxMind City 可用")
+      )
     ).toHaveLength(1);
   });
 });

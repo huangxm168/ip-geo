@@ -5,9 +5,9 @@
  *   ip-geo ip2region fetch --dir <目录> [--cache-dir <目录>] [--optional]
  *       按包里的清单取用 ip2region 数据文件。--optional：取不到只提示、不以失败退出（开发服务用）
  *
- *   ip-geo doctor [--ip2region <目录>] [--maxmind <目录>] [--max-age-days <天数>] [--ip <地址>]…
- *       自检：两类数据在不在、版本、构建日期、MaxMind 是否过久没更新（缺省 14 天）；给了 --ip 就顺带查一遍。
- *       有错误（文件缺失、与清单不符、打不开）时以 1 退出；只是过久没更新时提示、以 0 退出
+ *   ip-geo doctor [--ip2region <目录>] [--maxmind <目录>] [--warn-days <天数>] [--max-age-days <天数>] [--ip <地址>]…
+ *       自检：两类数据在不在、版本、构建日期；给了 --ip 就顺带查一遍。MaxMind 超过 --warn-days（缺省 14）天没更新时
+ *       提示、以 0 退出；超过 --max-age-days（缺省 30，与解析器停用的上限相同）天、文件缺失、与清单不符、打不开时以 1 退出
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -19,11 +19,15 @@ import { fetchIp2region, sha256 } from "./fetch.js";
 import { IP2REGION_FILE, readManifest } from "./manifest.js";
 import { createGeoResolver } from "./resolver.js";
 import { errorMessage } from "./sources/ip2region.js";
-import { ASN_FILE, CITY_FILE } from "./sources/maxmind.js";
+import {
+  ASN_FILE,
+  CITY_FILE,
+  DEFAULT_MAX_DATA_AGE_DAYS,
+} from "./sources/maxmind.js";
 
 const USAGE = `用法：
   ip-geo ip2region fetch --dir <目录> [--cache-dir <目录>] [--optional]
-  ip-geo doctor [--ip2region <目录>] [--maxmind <目录>] [--max-age-days <天数>] [--ip <地址>]…
+  ip-geo doctor [--ip2region <目录>] [--maxmind <目录>] [--warn-days <天数>] [--max-age-days <天数>] [--ip <地址>]…
   ip-geo --version`;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -83,10 +87,15 @@ async function doctorCommand(args: string[]): Promise<number> {
     options: {
       ip2region: { type: "string" },
       maxmind: { type: "string" },
-      "max-age-days": { type: "string", default: "14" },
+      "warn-days": { type: "string", default: "14" },
+      "max-age-days": {
+        type: "string",
+        default: String(DEFAULT_MAX_DATA_AGE_DAYS),
+      },
       ip: { type: "string", multiple: true },
     },
   });
+  const warnDays = Number(values["warn-days"]);
   const maxAgeDays = Number(values["max-age-days"]);
   let errors = 0;
   const ok = (message: string) => {
@@ -138,7 +147,11 @@ async function doctorCommand(args: string[]): Promise<number> {
         );
         const line = `MaxMind ${edition}：${databaseType}，构建于 ${buildEpoch.toISOString().slice(0, 10)}（${String(ageDays)} 天前）`;
         if (ageDays > maxAgeDays) {
-          warn(`${line}，超过 ${String(maxAgeDays)} 天，检查定时更新`);
+          fail(
+            `${line}，超过 ${String(maxAgeDays)} 天，解析器已停用它，检查定时更新`
+          );
+        } else if (ageDays > warnDays) {
+          warn(`${line}，超过 ${String(warnDays)} 天，检查定时更新`);
         } else {
           ok(line);
         }
@@ -155,6 +168,7 @@ async function doctorCommand(args: string[]): Promise<number> {
       const resolver = createGeoResolver({
         ip2regionDir: values.ip2region,
         maxmindDir: values.maxmind,
+        maxDataAgeDays: maxAgeDays,
         logger: { info: () => {}, warn, error: fail },
       });
       for (const ip of values.ip) {

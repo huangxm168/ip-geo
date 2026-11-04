@@ -1,5 +1,5 @@
 /**
- * 解析器：把两类数据与分流规则接起来，对外只有「查一个 IP」与「看状态」
+ * 解析器：把两类数据与分流规则接起来，对外只有「查一个 IP」「加载并看状态」「看状态」
  *
  * 网站在进程里建一个就够（两类数据都在内存里，建多个就多占多份）
  */
@@ -10,7 +10,7 @@ import { isPublicIp, normalizeIp } from "./ip.js";
 import { SPECIAL_REGIONS } from "./names.js";
 import { resolveGeo } from "./rules.js";
 import { errorMessage, Ip2regionSource } from "./sources/ip2region.js";
-import { MaxmindSource } from "./sources/maxmind.js";
+import { DEFAULT_MAX_DATA_AGE_DAYS, MaxmindSource } from "./sources/maxmind.js";
 import type {
   GeoLogger,
   GeoResolver,
@@ -48,6 +48,10 @@ export function createGeoResolver(options: GeoResolverOptions): GeoResolver {
     0,
     options.recheckIntervalMs ?? DEFAULT_RECHECK_MS
   );
+  const maxAgeDays =
+    options.maxDataAgeDays === undefined
+      ? DEFAULT_MAX_DATA_AGE_DAYS
+      : options.maxDataAgeDays;
   const ip2region = new Ip2regionSource(
     options.ip2regionDir,
     intervalMs,
@@ -56,8 +60,14 @@ export function createGeoResolver(options: GeoResolverOptions): GeoResolver {
   const maxmind = new MaxmindSource(
     options.maxmindDir || null,
     intervalMs,
+    maxAgeDays && maxAgeDays > 0 ? maxAgeDays : null,
     logger
   );
+
+  const status = () => ({
+    ip2region: ip2region.status(),
+    maxmind: maxmind.status(),
+  });
 
   return {
     async lookup(rawIp) {
@@ -77,11 +87,24 @@ export function createGeoResolver(options: GeoResolverOptions): GeoResolver {
         const mainland =
           record.iso === "CN" &&
           !(record.province && SPECIAL_REGIONS[record.province]);
-        const loaded = mainland ? null : await maxmind.current();
+        let hit: ReturnType<MaxmindSource["lookup"]> = {
+          city: null,
+          asn: null,
+        };
+        if (!mainland) {
+          // MaxMind 这一段出了意外就当它不可用：结果记降级、日后还能补解析，而不是整条记为空
+          try {
+            hit = maxmind.lookup(ip, await maxmind.current());
+          } catch (err) {
+            logger.error(
+              `查询 ${ip} 时 MaxMind 出错，按不可用处理：${errorMessage(err)}`
+            );
+          }
+        }
         return resolveGeo({
           ip2region: record,
           ip2regionVersion: version,
-          maxmind: loaded ? maxmind.lookup(ip, loaded) : null,
+          ...hit,
         });
       } catch (err) {
         logger.error(
@@ -91,8 +114,16 @@ export function createGeoResolver(options: GeoResolverOptions): GeoResolver {
       }
     },
 
-    status() {
-      return { ip2region: ip2region.status(), maxmind: maxmind.status() };
+    async ready() {
+      try {
+        ip2region.ensureLoaded();
+        await maxmind.current();
+      } catch (err) {
+        logger.error(`加载数据时出错：${errorMessage(err)}`);
+      }
+      return status();
     },
+
+    status,
   };
 }

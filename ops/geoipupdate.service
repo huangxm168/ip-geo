@@ -10,6 +10,7 @@ After=network-online.target
 Type=oneshot
 # 先比对哈希，没有新版本时不下载、不计额度；有新版本时写临时文件再改名，网站那边按修改时间自动换上
 ExecStart=/usr/bin/geoipupdate -v
+# 失败通知：用 systemctl edit 加覆盖片段接 OnFailure=，不改本模板（见 docs/operations.md「监测」）
 # 刻意不设 Restart：免费账户每 24 小时只有 30 次下载，失败就等下一次定时，不在这里循环重试
 ProtectSystem=strict
 ReadWritePaths=/var/lib/GeoIP

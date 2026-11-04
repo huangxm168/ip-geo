@@ -1,20 +1,24 @@
 /**
  * 分流规则（纯函数）：把 ip2region 与 MaxMind 各自查到的东西合成一条结果
  *
- * 1. 国内外只按 ip2region 判：MaxMind 对国内 IP 的城市不准，不能反过来让它判
+ * 1. 国内外的边界只按 ip2region 判：MaxMind 对国内 IP 不准，不能反过来让它判
  * 2. 中国大陆：一律取 ip2region（省、市、运营商），不查 MaxMind
- * 3. 港澳台：国家、省一级、运营商取 ip2region；城市取 MaxMind City（它判的国家也是港澳台那一个时才采用）；
+ * 3. 港澳台：国家、省一级、运营商取 ip2region；城市取 MaxMind City（它判的也是港澳台那一地时才采用）；
  *    ip2region 没有运营商时用 MaxMind ASN 的网络运营商名补上
- * 4. 海外：国家按 ip2region 的代码、取简体中文名；MaxMind City 判的国家与之一致时，省 / 州、城市取 MaxMind；
+ * 4. 海外：一个地点只取一家，不跨来源拼层级。MaxMind City 有国家以下的地点（州或城市至少一个）、且它判的
+ *    国家不在中国大陆与港澳台之内时，国家、州、城市整套取 MaxMind；否则整套取 ip2region。
  *    运营商取 MaxMind ASN，没有再用 ip2region 的
- * 5. MaxMind 不可用：港澳台与海外先记 ip2region 的粗结果，来源标 `ip2region-fallback`，日后可以补解析
+ * 5. City 与 ASN 各自独立：City 不可用时地点记 ip2region 的粗结果、来源标 `ip2region-fallback`（日后可以补解析），
+ *    ASN 照常补运营商；ASN 不可用时运营商用 ip2region 的
+ * 6. MaxMind 的地名一律取英文：英文名每一条都有、跨数据版本不变，与 ip2region 的海外地名同一种写法，
+ *    按州 / 城市汇总时两种来源的行能合在一起
  *
  * 规则的来龙去脉与例子见 docs/rules.md；每一条都由 test/rules.test.ts 钉住
  */
 
 import type { AsnResponse, CityResponse } from "maxmind";
 
-import { countryNameZh, pickName, SPECIAL_REGIONS } from "./names.js";
+import { countryNameZh, englishName, SPECIAL_REGIONS } from "./names.js";
 import type { GeoResult } from "./types.js";
 
 /** ip2region 一条结果拆开后的五段，`0` 已归一为 null */
@@ -37,26 +41,31 @@ export interface MaxmindFileTag {
   date: string;
 }
 
-/** MaxMind 可用时这一次查询的结果；不可用时整个为 null */
-export interface MaxmindHit {
-  city: CityResponse | null;
-  asn: AsnResponse | null;
-  cityFile: MaxmindFileTag;
-  asnFile: MaxmindFileTag;
+/** 一个可用的 MaxMind 库对这个 IP 的查询结果（record 为 null 表示查过了、库里没有） */
+export interface MaxmindLookup<T> {
+  record: T | null;
+  file: MaxmindFileTag;
 }
 
 export interface ResolveInput {
   ip2region: Ip2regionRecord;
   ip2regionVersion: string;
-  maxmind: MaxmindHit | null;
+  /** City 库不可用（没配目录、文件缺失、打不开、过期停用）时为 null */
+  city: MaxmindLookup<CityResponse> | null;
+  /** ASN 库不可用时为 null */
+  asn: MaxmindLookup<AsnResponse> | null;
 }
+
+// MaxMind 判到这几个地方时与 ip2region 划的边界冲突，以 ip2region 为准
+const CHINA_CODES = new Set(["CN", "HK", "MO", "TW"]);
 
 export function resolveGeo({
   ip2region,
   ip2regionVersion,
-  maxmind,
+  city,
+  asn,
 }: ResolveInput): GeoResult {
-  const { country, province, city, isp, iso } = ip2region;
+  const { country, province, isp, iso } = ip2region;
 
   if (iso === "CN") {
     const special = province ? SPECIAL_REGIONS[province] : undefined;
@@ -65,7 +74,7 @@ export function resolveGeo({
         countryCode: "CN",
         countryName: "中国",
         region: province,
-        city,
+        city: ip2region.city,
         isp,
         source: "ip2region",
         version: ip2regionVersion,
@@ -73,76 +82,71 @@ export function resolveGeo({
     }
 
     // 港澳台
-    if (!maxmind) {
-      return {
-        countryCode: special.code,
-        countryName: special.name,
-        region: province,
-        city: null,
-        isp,
-        source: "ip2region-fallback",
-        version: ip2regionVersion,
-      };
-    }
     const used: MaxmindFileTag[] = [];
-    const mmCity = sameCountry(maxmind.city, special.code)
-      ? pickName(maxmind.city?.city?.names)
-      : null;
-    if (mmCity) used.push(maxmind.cityFile);
-    let finalIsp = isp;
-    if (!finalIsp) {
-      finalIsp = maxmind.asn?.autonomous_system_organization ?? null;
-      if (finalIsp) used.push(maxmind.asnFile);
-    }
+    const mmCity =
+      city?.record?.country?.iso_code === special.code
+        ? englishName(city.record.city?.names)
+        : null;
+    if (city && mmCity) used.push(city.file);
+    const finalIsp = isp ?? asnOrganization(asn, used);
     return {
       countryCode: special.code,
       countryName: special.name,
       region: province,
       city: mmCity,
       isp: finalIsp,
-      source: mmCity ? "ip2region+maxmind" : "ip2region",
+      source: !city
+        ? "ip2region-fallback"
+        : mmCity
+          ? "ip2region+maxmind"
+          : "ip2region",
       version: joinVersion(ip2regionVersion, used),
     };
   }
 
   // 海外
-  const countryName = (iso && countryNameZh(iso)) ?? country;
-  if (!maxmind) {
-    return {
-      countryCode: iso,
-      countryName,
-      region: province,
-      city,
-      isp,
-      source: "ip2region-fallback",
-      version: ip2regionVersion,
-    };
-  }
   const used: MaxmindFileTag[] = [];
-  const located = iso !== null && sameCountry(maxmind.city, iso);
-  let region = province;
-  let finalCity = city;
-  if (located) {
-    region = pickName(maxmind.city?.subdivisions?.[0]?.names) ?? province;
-    finalCity = pickName(maxmind.city?.city?.names) ?? city;
-    used.push(maxmind.cityFile);
-  }
-  const asnIsp = maxmind.asn?.autonomous_system_organization ?? null;
-  if (asnIsp) used.push(maxmind.asnFile);
-  return {
+  const located = city ? maxmindLocation(city.record) : null;
+  if (city && located) used.push(city.file);
+  const location = located ?? {
     countryCode: iso,
-    countryName,
-    region,
-    city: finalCity,
-    isp: asnIsp ?? isp,
-    source: located ? "maxmind" : "ip2region",
+    countryName: (iso && countryNameZh(iso)) ?? country,
+    region: province,
+    city: ip2region.city,
+  };
+  // 运营商与地点分开取：ASN 有就用 ASN 的
+  const finalIsp = asnOrganization(asn, used) ?? isp;
+  return {
+    ...location,
+    isp: finalIsp,
+    source: !city ? "ip2region-fallback" : located ? "maxmind" : "ip2region",
     version: joinVersion(ip2regionVersion, used),
   };
 }
 
-// MaxMind City 判的国家与 ip2region 一致才采用它的地点，否则会出现「美国 · 东京」
-function sameCountry(record: CityResponse | null, code: string): boolean {
-  return record?.country?.iso_code === code;
+// MaxMind 的地点整套可用的条件：有国家以下的地点，且国家不在 ip2region 管的范围里
+function maxmindLocation(record: CityResponse | null) {
+  const code = record?.country?.iso_code;
+  if (!record || !code || CHINA_CODES.has(code)) return null;
+  const region = englishName(record.subdivisions?.[0]?.names);
+  const cityName = englishName(record.city?.names);
+  if (!region && !cityName) return null;
+  return {
+    countryCode: code,
+    countryName:
+      countryNameZh(code) ?? englishName(record.country.names) ?? code,
+    region,
+    city: cityName,
+  };
+}
+
+function asnOrganization(
+  asn: MaxmindLookup<AsnResponse> | null,
+  used: MaxmindFileTag[]
+): string | null {
+  const organization = asn?.record?.autonomous_system_organization ?? null;
+  if (asn && organization) used.push(asn.file);
+  return organization;
 }
 
 // 数据版本：ip2region 一段，MaxMind 按产品线各一段，如 `ip2region@6a276cc7c4f9 GeoLite2@City-20261030+ASN-20261103`

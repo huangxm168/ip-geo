@@ -1,7 +1,14 @@
 name: Release
 
-# 推 vX.Y.Z 标签：核对版本 → 全部检查 → 发布到 npm（可信发布，不存任何令牌）→ 建 GitHub Release
+# 推 vX.Y.Z 标签：检查 → 发布到 npm（可信发布，不存任何令牌）→ 建 GitHub Release，三个作业各拿各的权限：
+# - check：只读。依赖的安装脚本、lint、测试都在这里运行，拿不到发布身份；打出的压缩包作为产物交给下一步
+# - publish：唯一拿 id-token（npm 可信发布凭它换一次性的发布权限）。不检出代码、不装任何依赖，只发 check 打好的那个包
+# - github-release：只拿 contents: write，建 Release
+# action 一律钉到提交号（不随标签漂移），行尾注释是对应的版本；升级时连注释一起改
+# ⚠️ 本工作流刻意不用任何缓存（npm 缓存、ip2region 缓存）：缓存可以被别的工作流写入，而发出去的包就在 check 里构建，
+# 读了被投毒的缓存等于把它发布出去（zizmor 的 cache-poisoning 审计）。每次多下载约 11MB，换来构建只依赖锁文件与清单
 # ⚠️ 可信发布只能给已经存在的包配置：0.1.0 由作者手动发布，之后在 npm 包设置里登记本仓库的这个工作流
+
 on:
   push:
     tags: ["v*.*.*"]
@@ -10,25 +17,32 @@ concurrency:
   group: release
   cancel-in-progress: false
 
-permissions:
-  contents: write # 建 GitHub Release
-  id-token: write # npm 可信发布（OIDC）
+permissions: {}
 
 jobs:
-  release:
+  check:
     runs-on: ubuntu-latest
-    environment: npm
+    permissions:
+      contents: read
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+      spec: ${{ steps.pack.outputs.spec }}
+      node: ${{ steps.pack.outputs.node }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - name: 检查工作流（actionlint ＋ zizmor）
+        run: bash scripts/lint-workflows.sh
+        env:
+          GH_TOKEN: ${{ github.token }} # 只读，供 zizmor 的联网审计
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          # 自带的 npm 满足可信发布要求的 11.5.1 以上
           node-version-file: .nvmrc
-          registry-url: https://registry.npmjs.org
-          cache: npm
+          # 新版 setup-node 在 package.json 带上 packageManager 字段时会自动开 npm 缓存，显式关掉，以后加字段也不会静默打开
+          package-manager-cache: false
 
       - name: 核对标签与 package.json 的版本一致
         run: |
@@ -40,29 +54,71 @@ jobs:
 
       - run: npm ci
 
-      - uses: actions/cache@v6
-        with:
-          path: test/.data/ip2region
-          key: ip2region-${{ hashFiles('data/ip2region.json') }}
-
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
       - run: npm run check:pack
 
-      # 这个版本已在 npm 上时跳过（0.1.0 是作者手动发布的；Release 那一步失败后重跑也不会撞上「版本已存在」）
-      - name: 发布到 npm（可信发布会自动附上来源证明）
+      - name: 打包
+        id: pack
         run: |
-          spec="$(node -p 'const p = require("./package.json"); `${p.name}@${p.version}`')"
-          if npm view "$spec" version >/dev/null 2>&1; then
-            echo "$spec 已在 npm 上，跳过发布"
+          tarball="$(npm pack --silent | tail -n 1)"
+          {
+            echo "tarball=$tarball"
+            echo "spec=$(node -p 'const p = require("./package.json"); p.name + "@" + p.version')"
+            echo "node=$(cat .nvmrc)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write # npm 可信发布（OIDC）
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # 自带的 npm 满足可信发布要求的 11.5.1 以上
+          node-version: ${{ needs.check.outputs.node }}
+          package-manager-cache: false
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package
+
+      # 这个版本已在 npm 上时跳过（0.1.0 是作者手动发布的；后面的作业失败后重跑也不会撞上「版本已存在」）
+      - name: 发布到 npm（可信发布会自动附上来源证明）
+        env:
+          SPEC: ${{ needs.check.outputs.spec }}
+          TARBALL: ${{ needs.check.outputs.tarball }}
+        run: |
+          if npm view "$SPEC" version >/dev/null 2>&1; then
+            echo "$SPEC 已在 npm 上，跳过发布"
           else
-            npm publish --access public
+            npm publish "./$TARBALL" --access public
           fi
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 建 GitHub Release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: 建 GitHub Release（正文取标签指向的那次提交的完整说明）
         run: |
-          git log -1 --format=%B "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          git log -1 --format=%B HEAD > "$RUNNER_TEMP/notes.md"
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
         env:
           GH_TOKEN: ${{ github.token }}

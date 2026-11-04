@@ -6,22 +6,24 @@ IP geolocation that **uses [ip2region](https://github.com/lionsoul2014/ip2region
 
 ```
 114.114.114.114 → China · 江苏省 · 南京市                                   (ip2region)
-203.80.96.10    → Hong Kong · 香港特别行政区 · 九龙湾 · 香港宽频             (ip2region + MaxMind)
-210.196.3.183   → Japan · 东京都 · Azusawa · KDDI CORPORATION                (MaxMind)
+203.80.96.10    → Hong Kong · 香港特别行政区 · Kowloon Bay · 香港宽频         (ip2region + MaxMind)
+210.196.3.183   → Japan · Tokyo · Azusawa · KDDI CORPORATION                 (MaxMind)
 ```
 
-Names are returned in Simplified Chinese where available (the package was built for Chinese-language sites); log messages and CLI output are in Chinese as well.
+Country names are returned in Simplified Chinese, as are provinces and cities inside China (the package was built for Chinese-language sites); states and cities from MaxMind are in English. Log messages and CLI output are in Chinese.
 
 ## Why two datasets
 
 - ip2region is the most accurate source for mainland China (province, city, carrier), but outside China it only gives an English state name and usually no city; for Hong Kong / Macau / Taiwan it stops at the region level
 - MaxMind GeoLite is the best free dataset outside China, but it is inaccurate inside China (in our tests it had no province or city for Nanjing's public DNS, and reported a US company as the carrier for an Alibaba address)
-- So: **ip2region decides whether an IP is in China; mainland China comes from ip2region, the rest of the world from MaxMind, and Hong Kong / Macau / Taiwan combine both**. The full rules are in [docs/rules.md](docs/rules.md) (Chinese)
+- So: **ip2region decides whether an IP is in China; mainland China comes from ip2region, the rest of the world from MaxMind, and Hong Kong / Macau / Taiwan combine both**; a location (country, state, city) always comes from a single source, never stitched together from both. The full rules are in [docs/rules.md](docs/rules.md) (Chinese)
 
 ## Features
 
 - **Never throws**: missing data, corrupt files and invalid input all degrade to a coarse or empty result
 - **Hot reload without restarts**: when `geoipupdate` replaces a MaxMind file, the next check (hourly by default) loads the new file and **swaps it in only after it validates**; a bad file keeps the old data, a deleted file downgrades to fallback results
+- **City and ASN are independent**: if one database is missing, corrupt or expired, the other is still used
+- **Expired data is retired automatically**: a MaxMind file whose build date is older than 30 days (configurable) is no longer used and an error is logged daily; Hong Kong / Macau / Taiwan and overseas locations fall back and can be re-resolved later (the GeoLite EULA requires replacing old versions within 30 days of a new release)
 - **No timers, no file watchers**: the process can always exit (safe to import from build tools and one-off scripts)
 - **Data versions recorded**: every result carries the versions of the data files it was derived from
 - **ip2region versions ship with the package**: the package contains only a manifest (upstream commit + sha256); the data file is fetched against it, so updating the data means publishing a new version
@@ -56,21 +58,26 @@ const geo = createGeoResolver({
   ip2regionDir: "./vendor/ip2region",
   maxmindDir: "/var/lib/GeoIP", // optional
   recheckIntervalMs: 60 * 60 * 1000, // default: 1 hour
+  maxDataAgeDays: 30, // default: 30; null or 0 disables the limit
   logger: myLogger, // optional, defaults to console; needs info / warn / error
 });
+
+// Optionally call once at startup: loads both datasets and returns their state, so configuration
+// problems show up in the startup log and the first visitor does not wait for the load
+await geo.ready();
 
 const result = await geo.lookup("210.196.3.183");
 // {
 //   countryCode: "JP",
 //   countryName: "日本",
-//   region: "东京都",
+//   region: "Tokyo",
 //   city: "Azusawa",
 //   isp: "KDDI CORPORATION",
 //   source: "maxmind",
 //   version: "ip2region@6a276cc7c4f9 GeoLite2@City-20261030+ASN-20261103",
 // }
 
-geo.status(); // current load state of both datasets, for health checks
+geo.status(); // current load state of both datasets, for health checks; MaxMind City and ASN are each ready or unavailable
 ```
 
 ### Result fields
@@ -79,8 +86,8 @@ geo.status(); // current load state of both datasets, for health checks
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `countryCode` | ISO 3166-1 alpha-2; Hong Kong / Macau / Taiwan are always `HK` / `MO` / `TW`                                                                     |
 | `countryName` | Simplified Chinese country name derived from the code, independent of the data source                                                            |
-| `region`      | Province / state: full Chinese names inside China; elsewhere Simplified Chinese when available, otherwise English                                |
-| `city`        | City, same as above                                                                                                                              |
+| `region`      | Province / state: ip2region's Chinese names inside China and for Hong Kong / Macau / Taiwan; English elsewhere                                   |
+| `city`        | City: ip2region's full Chinese names inside China; English for Hong Kong / Macau / Taiwan and elsewhere                                          |
 | `isp`         | Carrier: ip2region inside China, the MaxMind ASN organization elsewhere                                                                          |
 | `source`      | Where the location came from: `ip2region` / `ip2region+maxmind` / `maxmind` / `ip2region-fallback` / `none` (see [docs/rules.md](docs/rules.md)) |
 | `version`     | Versions of the data files used, at most ~60 characters                                                                                          |
@@ -91,22 +98,22 @@ Private and reserved addresses, IPv6 and invalid input yield `source: "none"` wi
 
 ```bash
 ip-geo ip2region fetch --dir <dir> [--cache-dir <dir>] [--optional]
-ip-geo doctor [--ip2region <dir>] [--maxmind <dir>] [--max-age-days 14] [--ip <address>]…
+ip-geo doctor [--ip2region <dir>] [--maxmind <dir>] [--warn-days 14] [--max-age-days 30] [--ip <address>]…
 ```
 
-`doctor` checks that both datasets are present, which versions they are, and whether MaxMind is older than 14 days; with `--ip` it also runs lookups. It exits with 1 on errors.
+`doctor` checks that both datasets are present and which versions they are; with `--ip` it also runs lookups. It warns when MaxMind is older than `--warn-days` days, and exits with 1 when it is older than `--max-age-days` (the same limit at which the resolver retires it) or on any other error.
 
 ## Data licenses and attribution
 
 The code is MIT-licensed. The data has its own licenses; credit both on your site's privacy policy or analytics page:
 
-- MaxMind GeoLite: [GeoLite EULA](https://www.maxmind.com/en/geolite2/eula). Attribution: "This product includes GeoLite Data created by MaxMind, available from https://www.maxmind.com". Internal use only, must not be used to identify or locate an individual, and old versions must be replaced within 30 days of a new release (the timer takes care of this)
+- MaxMind GeoLite: [GeoLite EULA](https://www.maxmind.com/en/geolite2/eula). Attribution: "This product includes GeoLite Data created by MaxMind, available from https://www.maxmind.com". Internal use only, must not be used to identify or locate an individual, and old versions must be replaced within 30 days of a new release (the timer takes care of this; if it breaks, the resolver retires data older than 30 days — see [docs/operations.md](docs/operations.md) for failure notifications)
 - ip2region: [lionsoul2014/ip2region](https://github.com/lionsoul2014/ip2region), Apache-2.0 or MIT
 
 ## Limitations
 
 - IPv6 is not resolved yet (always empty); see [docs/rules.md](docs/rules.md)
-- MaxMind's Chinese names are incomplete, so overseas states and cities mix Chinese and English
+- States and cities outside mainland China are in English (MaxMind's Chinese names are incomplete and change as coverage grows; see [docs/rules.md](docs/rules.md)); translate them in your presentation layer if needed
 - MaxMind restricts GeoLite City by account location; see [docs/operations.md](docs/operations.md)
 
 ## Development
@@ -115,6 +122,7 @@ The code is MIT-licensed. The data has its own licenses; credit both on your sit
 npm install
 npm test          # first run fetches the ip2region data into test/.data/
 npm run lint
+npm run lint:workflows   # workflow checks (requires Docker)
 npm run typecheck
 npm run check:pack
 ```

@@ -8,7 +8,11 @@
 export { createGeoResolver } from "./resolver.js";
 export { isPublicIp, normalizeIp } from "./ip.js";
 export { IP2REGION_FILE } from "./manifest.js";
-export { ASN_FILE, CITY_FILE } from "./sources/maxmind.js";
+export {
+  ASN_FILE,
+  CITY_FILE,
+  DEFAULT_MAX_DATA_AGE_DAYS,
+} from "./sources/maxmind.js";
 export type {
   GeoLogger,
   GeoResolver,
@@ -16,5 +20,6 @@ export type {
   GeoResolverStatus,
   GeoResult,
   GeoSource,
+  MaxmindFileState,
   MaxmindFileStatus,
 } from "./types.js";

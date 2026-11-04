@@ -1,5 +1,5 @@
 /**
- * 名称：港澳台的固定写法、按 ISO 代码取简体中文国家名、MaxMind 多语言名称的取舍
+ * 名称：港澳台的固定写法、按 ISO 代码取简体中文国家名、MaxMind 地名的取舍
  */
 
 // ip2region 把港澳台记作「中国｜香港特别行政区｜…｜CN」，按省一级认出来
@@ -24,14 +24,12 @@ export function countryNameZh(code: string): string | null {
   }
 }
 
-/** MaxMind 的多语言名称：优先简体中文，没有就取英文 */
-export function pickName(
-  names:
-    | {
-        readonly "zh-CN"?: string | undefined;
-        readonly en?: string | undefined;
-      }
-    | undefined
+/**
+ * MaxMind 的地名一律取英文：中文名覆盖不全、日后补上时同一个地方新旧数据会是两个名字；
+ * 英文名每一条都有、跨版本不变，也与 ip2region 的海外地名同一种写法
+ */
+export function englishName(
+  names: { readonly en?: string | undefined } | undefined
 ): string | null {
-  return names?.["zh-CN"] ?? names?.en ?? null;
+  return names?.en || null;
 }
