@@ -59,7 +59,7 @@ const geo = createGeoResolver({
   maxmindDir: "/var/lib/GeoIP", // optional
   recheckIntervalMs: 60 * 60 * 1000, // default: 1 hour
   maxDataAgeDays: 30, // default: 30; null or 0 disables the limit
-  logger: myLogger, // optional, defaults to console; needs info / warn / error
+  logger: myLogger, // optional, defaults to console; needs info / warn / error, each taking an event object (see "Logging" below)
 });
 
 // Optionally call once at startup: loads both datasets and returns their state, so configuration
@@ -93,6 +93,25 @@ geo.status(); // current load state of both datasets, for health checks; MaxMind
 | `version`     | Versions of the data files used, at most ~60 characters                                                                                          |
 
 Private and reserved addresses, IPv6 and invalid input yield `source: "none"` with every other field `null`.
+
+### Logging
+
+`logger.info` / `warn` / `error` each receive an event object: `code` is a fixed code to classify by; `message` is a human-readable Chinese description that may include data file paths, versions, build dates and error text, but **never the visitor's IP**; the remaining properties depend on the event. Without a `logger`, only `message` is printed to the console. If the `logger` itself throws, resolution is unaffected and that event's `message` is printed to the console instead.
+
+| `code`                        | Level               | Fields                             | When                                                                                                     |
+| ----------------------------- | ------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `ip2region_loaded`            | info                | `version`                          | The ip2region data was loaded into memory                                                                |
+| `ip2region_load_failed`       | error               | `path`, `error`                    | The ip2region data could not be read; locations are empty until the next retry                           |
+| `ip2region_manifest_mismatch` | warn                | `path`, `sha256` (first 12 chars)  | The data file differs from the package manifest; it is used anyway                                       |
+| `maxmind_status`              | info / warn / error | `city`, `asn` (as in `status()`)   | City / ASN availability changed: info when both are ready, warn if one is not, error if stale            |
+| `maxmind_file_rejected`       | error               | `edition`, `path`, `error`, `kept` | A replacement file failed validation; the loaded one stays in use                                        |
+| `maxmind_lookup_failed`       | error               | `error`                            | Checking the MaxMind files during a lookup failed; that result falls back as if MaxMind were unavailable |
+| `lookup_failed`               | error               | `ip`, `error`                      | A lookup failed; that result is empty                                                                    |
+| `load_failed`                 | error               | `error`                            | `ready()` hit an unexpected error while loading                                                          |
+
+The visitor's IP only appears in the `ip` property of `lookup_failed` (normalized: `::ffff:1.2.3.4` becomes `1.2.3.4`); drop that property if you do not want it in your logs. ⚠️ Its `error` is the original exception, whose message may contain the IP in the same form as the `ip` property, so you can replace it by that value.
+
+In `status()`, an unavailable MaxMind file carries `cause`: `not_loaded` / `missing` / `invalid` (cannot be opened or failed validation) / `stale` (build date past the limit; also carries `buildDate`); `reason` is a human-readable Chinese description.
 
 ## CLI
 

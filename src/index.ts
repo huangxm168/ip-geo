@@ -14,6 +14,8 @@ export {
   DEFAULT_MAX_DATA_AGE_DAYS,
 } from "./sources/maxmind.js";
 export type {
+  GeoLogCode,
+  GeoLogEvent,
   GeoLogger,
   GeoResolver,
   GeoResolverOptions,
@@ -22,4 +24,5 @@ export type {
   GeoSource,
   MaxmindFileState,
   MaxmindFileStatus,
+  MaxmindUnavailableCause,
 } from "./types.js";

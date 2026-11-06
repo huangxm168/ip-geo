@@ -3,6 +3,17 @@
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。0.x 期间接口可能调整，1.0.0 之后才承诺兼容。
 ip2region 换数据版本也发新版本，在这里写明上游提交号。
 
+## 0.3.0
+
+⚠️ 日志接口不兼容：传了 `logger` 的使用方要改写适配层。
+
+- **日志改为事件对象**：`logger` 的 `info` / `warn` / `error` 由收一句中文改为收 `{ code, message, …字段 }`。`code` 是固定的 8 种（见 README「日志」），`message` 照旧是中文说明，其余字段按事件各异；导出类型 `GeoLogEvent`、`GeoLogCode`
+- **日志的说明文字不再带访客 IP**：查询出错时说明文字是固定的，不再拼接 IP 与异常原文（异常原样放在 `error` 字段）。此前句子里插着 IP，使用方无法在不解析句子的情况下把它去掉
+- **访客 IP 只在 `lookup_failed` 的 `ip` 字段里**，取规整后的写法（`::ffff:1.2.3.4` 记作 `1.2.3.4`），与异常原文里出现的写法相同；`maxmind_lookup_failed` 出错的是文件检查、与 IP 无关，不带 IP
+- **`logger` 抛错不再影响解析**：此前 `lookup()` 与 `ready()` 会把它抛给调用方，ip2region 还会把「已加载」误记成加载失败；现在那一条改由 console 打出说明文字。`GeoLogger` 的三个方法改为函数属性的写法，只收一部分事件的函数不再能通过类型检查
+- **缺省的 console 输出只打 `message`**；命令行 `doctor --ip` 查的是使用者自己给的地址，出错时照旧打出 IP 与异常原文
+- `status()` 里不可用的 MaxMind 文件新增 `cause`（`not_loaded` / `missing` / `invalid` / `stale`），`cause` 为 `stale` 时必带 `buildDate`；导出类型 `MaxmindUnavailableCause`。`reason` 不变
+
 ## 0.2.0
 
 ⚠️ 规则与接口都有不兼容的改动，升级后新旧两版的结果不能直接放在一起比。

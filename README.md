@@ -57,7 +57,7 @@ const geo = createGeoResolver({
   maxmindDir: "/var/lib/GeoIP", // 可省
   recheckIntervalMs: 60 * 60 * 1000, // 缺省 1 小时
   maxDataAgeDays: 30, // 缺省 30 天，null 或 0 表示不设上限
-  logger: myLogger, // 可省，缺省打到 console；要实现 info / warn / error
+  logger: myLogger, // 可省，缺省打到 console；要实现 info / warn / error，每个方法收一个事件对象（见下文「日志」）
 });
 
 // 启动时调一次（可省）：加载两份数据并返回状态，配置问题在启动日志里就能看到，第一位访客也不必等加载
@@ -90,6 +90,25 @@ geo.status(); // 两份数据此刻的加载状态，给健康检查用；MaxMin
 | `version`     | 用到的数据文件版本，最长约 60 个字符                                                                                               |
 
 内网与保留地址、IPv6、非法输入一律是 `source: "none"`、其余为 `null`。
+
+### 日志
+
+`logger` 的 `info` / `warn` / `error` 各收一个事件对象：`code` 是固定的代码，使用方按它归类；`message` 是给人读的中文，可能带数据文件的路径、版本、构建日期与报错原文，**不带访客 IP**；其余是这种事件各自的字段。不传 `logger` 时只把 `message` 打到 console。`logger` 自己抛错不影响解析，那一条改由 console 打出 `message`。
+
+| `code`                        | 级别                | 字段                               | 什么时候                                                                     |
+| ----------------------------- | ------------------- | ---------------------------------- | ---------------------------------------------------------------------------- |
+| `ip2region_loaded`            | info                | `version`                          | ip2region 数据读进内存                                                       |
+| `ip2region_load_failed`       | error               | `path`、`error`                    | ip2region 数据读不了，地区一律记为空，隔一个检查间隔再试                     |
+| `ip2region_manifest_mismatch` | warn                | `path`、`sha256`（前 12 位）       | 数据文件与包里的清单不一致，照常使用                                         |
+| `maxmind_status`              | info / warn / error | `city`、`asn`（同 `status()`）     | City 与 ASN 的可用状态变了：都可用 info，有一个不可用 warn，有一个过期 error |
+| `maxmind_file_rejected`       | error               | `edition`、`path`、`error`、`kept` | 换上来的新文件不合格，继续用已加载的旧版                                     |
+| `maxmind_lookup_failed`       | error               | `error`                            | 查询时检查 MaxMind 文件出了意外，这一条按 MaxMind 不可用记降级               |
+| `lookup_failed`               | error               | `ip`、`error`                      | 查询时出了意外，这一条记为空                                                 |
+| `load_failed`                 | error               | `error`                            | `ready()` 加载数据时出了意外                                                 |
+
+访客 IP 只出现在 `lookup_failed` 的 `ip` 字段里（规整后的写法，`::ffff:1.2.3.4` 记作 `1.2.3.4`），不想把它写进日志就丢掉这个字段。⚠️ 它的 `error` 是原样交出的异常，消息里有可能带着那个 IP，写法与 `ip` 字段相同，可以按它替换掉。
+
+`status()` 里不可用的 MaxMind 文件带 `cause`：`not_loaded`（尚未加载）/ `missing`（文件不存在）/ `invalid`（打不开或校验不过）/ `stale`（构建日期超过上限已停用，另带 `buildDate`）；`reason` 是给人读的中文。
 
 ## 命令行
 

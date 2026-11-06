@@ -77,12 +77,19 @@ export class Ip2regionSource {
         loadedAt: new Date(),
       };
       this.#failedAt = null;
-      this.#logger.info(`ip2region 已加载：${this.#loaded.version}`);
+      this.#logger.info({
+        code: "ip2region_loaded",
+        message: `ip2region 已加载：${this.#loaded.version}`,
+        version: this.#loaded.version,
+      });
     } catch (err) {
       this.#failedAt = Date.now();
-      this.#logger.error(
-        `ip2region 数据文件加载失败（${this.#path}，用 ip-geo ip2region fetch 按清单取用），地区一律记为空：${errorMessage(err)}`
-      );
+      this.#logger.error({
+        code: "ip2region_load_failed",
+        message: `ip2region 数据文件加载失败（${this.#path}，用 ip-geo ip2region fetch 按清单取用），地区一律记为空：${errorMessage(err)}`,
+        path: this.#path,
+        error: err,
+      });
     }
     return this.#loaded;
   }
@@ -97,10 +104,14 @@ export class Ip2regionSource {
     } catch {
       // 清单读不到只影响版本号的写法
     }
-    this.#logger.warn(
-      `ip2region 数据文件与包里的清单不一致（sha256 ${actual.slice(0, 12)}…），照常使用；按清单取用请运行 ip-geo ip2region fetch`
-    );
-    return `ip2region@sha256-${actual.slice(0, 12)}`;
+    const sha256 = actual.slice(0, 12);
+    this.#logger.warn({
+      code: "ip2region_manifest_mismatch",
+      message: `ip2region 数据文件与包里的清单不一致（sha256 ${sha256}…），照常使用；按清单取用请运行 ip-geo ip2region fetch`,
+      path: this.#path,
+      sha256,
+    });
+    return `ip2region@sha256-${sha256}`;
   }
 }
 

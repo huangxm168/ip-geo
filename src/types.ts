@@ -30,11 +30,74 @@ export interface GeoResult {
   version: string | null;
 }
 
-/** 日志函数：缺省打到 console。传入时只需实现用得到的三个级别 */
+/**
+ * 日志事件：`code` 是固定词表，使用方按它归类；`message` 是给人读的中文，可能带数据文件的路径、版本、
+ * 构建日期与报错原文，**不会带访客 IP**——IP 只出现在 `lookup_failed` 的 `ip` 字段里，不想记就丢掉这个字段
+ *
+ * - `ip2region_loaded`（info）：数据文件读进内存
+ * - `ip2region_load_failed`（error）：数据文件读不了，地区一律记为空，隔一个检查间隔再试
+ * - `ip2region_manifest_mismatch`（warn）：数据文件与包里的清单不一致，照常使用
+ * - `maxmind_status`（info / warn / error）：City 与 ASN 的可用状态变了（同一状态只报一次；过期停用时天数每天变，
+ *   所以每天报一次）。两个都可用是 info，有一个不可用是 warn，有一个过期停用是 error
+ * - `maxmind_file_rejected`（error）：换上来的新文件不合格，继续用已加载的旧版
+ * - `maxmind_lookup_failed`（error）：查询时检查 MaxMind 文件出了意外，这一条按 MaxMind 不可用记降级。
+ *   出错的是文件检查、与查的是哪个 IP 无关，所以不带 IP
+ * - `lookup_failed`（error）：查询时出了意外，这一条记为空
+ * - `load_failed`（error）：`ready()` 加载数据时出了意外
+ *
+ * ⚠️ `lookup_failed` 的 `error` 是原样交出的异常，它的消息里有可能带着那个 IP，写法与 `ip` 字段相同
+ */
+export type GeoLogEvent =
+  | { code: "ip2region_loaded"; message: string; version: string }
+  | {
+      code: "ip2region_load_failed";
+      message: string;
+      path: string;
+      error: unknown;
+    }
+  | {
+      code: "ip2region_manifest_mismatch";
+      message: string;
+      path: string;
+      /** 数据文件 sha256 的前 12 位 */
+      sha256: string;
+    }
+  | {
+      code: "maxmind_status";
+      message: string;
+      city: MaxmindFileState;
+      asn: MaxmindFileState;
+    }
+  | {
+      code: "maxmind_file_rejected";
+      message: string;
+      edition: "City" | "ASN";
+      path: string;
+      error: unknown;
+      /** 继续使用的那一份 */
+      kept: MaxmindFileStatus;
+    }
+  | { code: "maxmind_lookup_failed"; message: string; error: unknown }
+  | {
+      code: "lookup_failed";
+      message: string;
+      /** 规整后的写法（`::ffff:1.2.3.4` 记作 `1.2.3.4`）；还没走到规整那一步时是传入的原值 */
+      ip: string;
+      error: unknown;
+    }
+  | { code: "load_failed"; message: string; error: unknown };
+
+export type GeoLogCode = GeoLogEvent["code"];
+
+/**
+ * 日志函数：缺省打到 console（只打 `message`）。传入时要实现三个级别；它抛错不影响解析，那一条改由 console 打出
+ *
+ * 写成属性而不是方法：方法的参数按双变检查，只收一部分事件的函数也能通过类型检查
+ */
 export interface GeoLogger {
-  info(message: string): void;
-  warn(message: string): void;
-  error(message: string): void;
+  info: (event: GeoLogEvent) => void;
+  warn: (event: GeoLogEvent) => void;
+  error: (event: GeoLogEvent) => void;
 }
 
 export interface GeoResolverOptions {
@@ -62,10 +125,31 @@ export interface MaxmindFileStatus {
   loadedAt: Date;
 }
 
-/** 一个 MaxMind 数据文件此刻能不能用；City 与 ASN 各自独立，一个不可用不牵连另一个 */
+/**
+ * MaxMind 数据文件不可用的原因：`not_loaded` 尚未加载、`missing` 文件不存在、`invalid` 打不开或校验不过、
+ * `stale` 构建日期超过上限已停用
+ */
+export type MaxmindUnavailableCause =
+  "not_loaded" | "missing" | "invalid" | "stale";
+
+/**
+ * 一个 MaxMind 数据文件此刻能不能用；City 与 ASN 各自独立，一个不可用不牵连另一个。
+ * 不可用时 `cause` 是固定词表、`reason` 是给人读的中文；过期停用时另带构建日期
+ */
 export type MaxmindFileState =
   | ({ state: "ready" } & MaxmindFileStatus)
-  | { state: "unavailable"; reason: string };
+  | {
+      state: "unavailable";
+      cause: Exclude<MaxmindUnavailableCause, "stale">;
+      reason: string;
+    }
+  | {
+      state: "unavailable";
+      cause: "stale";
+      reason: string;
+      /** 构建日期（UTC），YYYY-MM-DD */
+      buildDate: string;
+    };
 
 export interface GeoResolverStatus {
   ip2region: { version: string; loadedAt: Date } | null;

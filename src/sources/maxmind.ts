@@ -22,6 +22,7 @@ import { Reader, type AsnResponse, type CityResponse } from "maxmind";
 
 import type { MaxmindFileTag, MaxmindLookup } from "../rules.js";
 import type {
+  GeoLogEvent,
   GeoLogger,
   GeoResolverStatus,
   MaxmindFileState,
@@ -49,12 +50,16 @@ interface LoadedFile {
   signature: string;
 }
 
-/** 一个库的槽位：可用的文件，或不可用的原因；过期停用的文件只记签名，没换新版就不必重读 */
+type Unavailable = Extract<MaxmindFileState, { state: "unavailable" }>;
+
+/** 一个库的槽位：可用的文件，或不可用的状态；过期停用的文件只记签名，没换新版就不必重读 */
 interface Slot {
   file: LoadedFile | null;
-  reason: string;
+  unavailable: Unavailable;
   stale: { signature: string; buildEpoch: Date; path: string } | null;
 }
+
+type RejectedEvent = Extract<GeoLogEvent, { code: "maxmind_file_rejected" }>;
 
 /** 此刻可用的两个库，各自可能为 null */
 export interface MaxmindFiles {
@@ -68,8 +73,8 @@ export class MaxmindSource {
   readonly #maxAgeMs: number | null;
   readonly #logger: GeoLogger;
   readonly #slots: Record<Edition, Slot> = {
-    City: { file: null, reason: "尚未加载", stale: null },
-    ASN: { file: null, reason: "尚未加载", stale: null },
+    City: { file: null, unavailable: notLoaded(), stale: null },
+    ASN: { file: null, unavailable: notLoaded(), stale: null },
   };
   #lastCheckAt: number | null = null;
   #checking: Promise<void> | null = null;
@@ -133,55 +138,65 @@ export class MaxmindSource {
   }
 
   async #check(dir: string): Promise<void> {
-    const kept: string[] = [];
+    const rejected: RejectedEvent[] = [];
     for (const [edition, file] of [
       ["City", CITY_FILE],
       ["ASN", ASN_FILE],
     ] as const) {
-      const problem = await this.#refresh(join(dir, file), edition);
-      if (problem) kept.push(problem);
+      const event = await this.#refresh(join(dir, file), edition);
+      if (event) rejected.push(event);
     }
-    for (const problem of kept) this.#logger.error(problem);
+    for (const event of rejected) this.#logger.error(event);
 
     const { City: city, ASN: asn } = this.#slots;
     const describeSlot = (edition: Edition, slot: Slot) =>
       slot.file
         ? `${edition} 可用：${describe(slot.file)}`
-        : `${edition} 不可用：${slot.reason}`;
+        : `${edition} 不可用：${slot.unavailable.reason}`;
     const level =
       city.stale || asn.stale
         ? "error"
         : city.file && asn.file
           ? "info"
           : "warn";
-    this.#report(
-      level,
-      `MaxMind ${describeSlot("City", city)}；${describeSlot("ASN", asn)}` +
-        (city.file ? "" : "。港澳台与海外的地点先记粗结果，日后可以补解析")
-    );
+    this.#report(level, {
+      code: "maxmind_status",
+      message:
+        `MaxMind ${describeSlot("City", city)}；${describeSlot("ASN", asn)}` +
+        (city.file ? "" : "。港澳台与海外的地点先记粗结果，日后可以补解析"),
+      city: slotState(city),
+      asn: slotState(asn),
+    });
   }
 
   /**
    * 一个库的检查：没变就沿用；变了就读新的、校验、换上；新文件不合格时沿用旧的（返回要记的错误）；
    * 文件不见了、打不开或过期时槽位清空并写明原因
    */
-  async #refresh(path: string, edition: Edition): Promise<string | null> {
+  async #refresh(
+    path: string,
+    edition: Edition
+  ): Promise<RejectedEvent | null> {
     const slot = this.#slots[edition];
     let signature: string;
     try {
       const info = await stat(path);
       signature = `${String(info.mtimeMs)}:${String(info.size)}:${String(info.ino)}`;
     } catch {
-      this.#clear(slot, `${path} 不存在`);
+      this.#clear(slot, {
+        state: "unavailable",
+        cause: "missing",
+        reason: `${path} 不存在`,
+      });
       return null;
     }
 
-    let kept: string | null = null;
+    let rejected: RejectedEvent | null = null;
     if (slot.stale?.signature === signature) {
       // 过期停用的那一份还没换：不必重读，只更新天数
       this.#clear(
         slot,
-        this.#staleReason(slot.stale.path, slot.stale.buildEpoch),
+        this.#staleState(slot.stale.path, slot.stale.buildEpoch),
         slot.stale
       );
       return null;
@@ -204,9 +219,16 @@ export class MaxmindSource {
       } catch (err) {
         const reason = `${path} 无法使用：${errorMessage(err)}`;
         if (slot.file) {
-          kept = `${reason}；继续使用已加载的 ${describe(slot.file)}`;
+          rejected = {
+            code: "maxmind_file_rejected",
+            message: `${reason}；继续使用已加载的 ${describe(slot.file)}`,
+            edition,
+            path,
+            error: err,
+            kept: slot.file.status,
+          };
         } else {
-          this.#clear(slot, reason);
+          this.#clear(slot, { state: "unavailable", cause: "invalid", reason });
           return null;
         }
       }
@@ -215,20 +237,20 @@ export class MaxmindSource {
     // 已加载的文件也会随时间过期，所以每次检查都要看
     const file = slot.file;
     if (this.#isTooOld(file.buildEpoch)) {
-      this.#clear(slot, this.#staleReason(path, file.buildEpoch), {
+      this.#clear(slot, this.#staleState(path, file.buildEpoch), {
         signature: file.signature,
         buildEpoch: file.buildEpoch,
         path,
       });
-      return kept;
+      return rejected;
     }
     slot.stale = null;
-    return kept;
+    return rejected;
   }
 
-  #clear(slot: Slot, reason: string, stale: Slot["stale"] = null) {
+  #clear(slot: Slot, unavailable: Unavailable, stale: Slot["stale"] = null) {
     slot.file = null;
-    slot.reason = reason;
+    slot.unavailable = unavailable;
     slot.stale = stale;
   }
 
@@ -240,24 +262,35 @@ export class MaxmindSource {
   }
 
   // 天数每天变一次，所以这条错误每天报一次
-  #staleReason(path: string, buildEpoch: Date): string {
+  #staleState(path: string, buildEpoch: Date): Unavailable {
     const days = Math.floor((Date.now() - buildEpoch.getTime()) / DAY_MS);
     const limit = String(Math.round((this.#maxAgeMs ?? 0) / DAY_MS));
-    return `${path} 构建于 ${isoDate(buildEpoch)}，已 ${String(days)} 天未更新，超过 ${limit} 天已停用（GeoLite 条款要求新版发布后 30 天内换掉旧版，检查 geoipupdate 定时器）`;
+    const buildDate = isoDate(buildEpoch);
+    return {
+      state: "unavailable",
+      cause: "stale",
+      reason: `${path} 构建于 ${buildDate}，已 ${String(days)} 天未更新，超过 ${limit} 天已停用（GeoLite 条款要求新版发布后 30 天内换掉旧版，检查 geoipupdate 定时器）`,
+      buildDate,
+    };
   }
 
-  // 同一个状态只报一次：每小时检查一次，不该每次都刷一条
-  #report(level: "info" | "warn" | "error", message: string) {
-    if (this.#lastReport === message) return;
-    this.#lastReport = message;
-    this.#logger[level](message);
+  // 同一个状态只报一次（按说明文字比，过期的天数也在里面）：每小时检查一次，不该每次都刷一条
+  #report(level: "info" | "warn" | "error", event: GeoLogEvent) {
+    if (this.#lastReport === event.message) return;
+    this.#lastReport = event.message;
+    this.#logger[level](event);
   }
 }
 
 function slotState(slot: Slot): MaxmindFileState {
+  // 交出拷贝：使用方改了也不会改到槽位
   return slot.file
     ? { state: "ready", ...slot.file.status }
-    : { state: "unavailable", reason: slot.reason };
+    : { ...slot.unavailable };
+}
+
+function notLoaded(): Unavailable {
+  return { state: "unavailable", cause: "not_loaded", reason: "尚未加载" };
 }
 
 // 数据库类型必须是「产品线-库」且库对得上（GeoLite2-City、GeoIP2-City、GeoLite2-ASN），并且能走通一次查询

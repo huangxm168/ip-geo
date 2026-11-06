@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach } from "vitest";
 
-import type { GeoLogger } from "../src/types.js";
+import type { GeoLogEvent, GeoLogger } from "../src/types.js";
 
 export const FIXTURES = join(import.meta.dirname, "fixtures/maxmind");
 export const IP2REGION_DIR = join(import.meta.dirname, ".data/ip2region");
@@ -36,15 +36,22 @@ export function maxmindDir(): string {
 }
 
 export interface RecordingLogger extends GeoLogger {
-  lines: { level: "info" | "warn" | "error"; message: string }[];
+  lines: {
+    level: "info" | "warn" | "error";
+    code: GeoLogEvent["code"];
+    message: string;
+    event: GeoLogEvent;
+  }[];
 }
 
 export function recordingLogger(): RecordingLogger {
   const lines: RecordingLogger["lines"] = [];
+  const record = (level: "info" | "warn" | "error") => (event: GeoLogEvent) =>
+    lines.push({ level, code: event.code, message: event.message, event });
   return {
     lines,
-    info: (message) => lines.push({ level: "info", message }),
-    warn: (message) => lines.push({ level: "warn", message }),
-    error: (message) => lines.push({ level: "error", message }),
+    info: record("info"),
+    warn: record("warn"),
+    error: record("error"),
   };
 }

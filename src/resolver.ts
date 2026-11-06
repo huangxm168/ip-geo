@@ -12,6 +12,7 @@ import { resolveGeo } from "./rules.js";
 import { errorMessage, Ip2regionSource } from "./sources/ip2region.js";
 import { DEFAULT_MAX_DATA_AGE_DAYS, MaxmindSource } from "./sources/maxmind.js";
 import type {
+  GeoLogEvent,
   GeoLogger,
   GeoResolver,
   GeoResolverOptions,
@@ -30,20 +31,40 @@ const NONE: GeoResult = Object.freeze({
   version: null,
 });
 
+// 缺省只打说明文字：查询出错时的 IP 与异常（消息里可能带着 IP）都不打
 const consoleLogger: GeoLogger = {
-  info: (message) => {
-    console.info(`[ip-geo] ${message}`);
+  info: (event) => {
+    console.info(`[ip-geo] ${event.message}`);
   },
-  warn: (message) => {
-    console.warn(`[ip-geo] ${message}`);
+  warn: (event) => {
+    console.warn(`[ip-geo] ${event.message}`);
   },
-  error: (message) => {
-    console.error(`[ip-geo] ${message}`);
+  error: (event) => {
+    console.error(`[ip-geo] ${event.message}`);
   },
 };
 
+// 使用方的 logger 抛错不能连累查询（lookup 与 ready 承诺永不抛错）：那一条改由 console 打出说明文字，
+// console 也出错就作罢。不兜住的话，抛错会从查询里冒出去，ip2region 还会把「已加载」误记成加载失败
+function guarded(logger: GeoLogger): GeoLogger {
+  const call =
+    (level: keyof GeoLogger) =>
+    (event: GeoLogEvent): void => {
+      try {
+        logger[level](event);
+      } catch {
+        try {
+          consoleLogger[level](event);
+        } catch {
+          // 无处可写
+        }
+      }
+    };
+  return { info: call("info"), warn: call("warn"), error: call("error") };
+}
+
 export function createGeoResolver(options: GeoResolverOptions): GeoResolver {
-  const logger = options.logger ?? consoleLogger;
+  const logger = guarded(options.logger ?? consoleLogger);
   const intervalMs = Math.max(
     0,
     options.recheckIntervalMs ?? DEFAULT_RECHECK_MS
@@ -71,9 +92,11 @@ export function createGeoResolver(options: GeoResolverOptions): GeoResolver {
 
   return {
     async lookup(rawIp) {
+      // 出错时报规整后的写法：之后各步（含 ip2region 的报错）用的都是它，使用方才能按 ip 字段抹掉异常里的 IP
+      let ip: string | null = null;
       try {
         if (!rawIp) return { ...NONE };
-        const ip = normalizeIp(rawIp);
+        ip = normalizeIp(rawIp);
         // 只放了 IPv4 的 ip2region 数据；国内外又只能靠它判，所以 IPv6 一律记为空
         if (isIP(ip) !== 4 || !isPublicIp(ip)) return { ...NONE };
 
@@ -96,9 +119,12 @@ export function createGeoResolver(options: GeoResolverOptions): GeoResolver {
           try {
             hit = maxmind.lookup(ip, await maxmind.current());
           } catch (err) {
-            logger.error(
-              `查询 ${ip} 时 MaxMind 出错，按不可用处理：${errorMessage(err)}`
-            );
+            // 出错的只会是文件检查（逐条查库的错误已在 MaxmindSource 里接住），与 IP 无关，不带它
+            logger.error({
+              code: "maxmind_lookup_failed",
+              message: "查询时检查 MaxMind 文件出错，这一条按不可用处理",
+              error: err,
+            });
           }
         }
         return resolveGeo({
@@ -107,9 +133,12 @@ export function createGeoResolver(options: GeoResolverOptions): GeoResolver {
           ...hit,
         });
       } catch (err) {
-        logger.error(
-          `查询 ${String(rawIp)} 时出错，记为空：${errorMessage(err)}`
-        );
+        logger.error({
+          code: "lookup_failed",
+          message: "查询时出错，这一条记为空",
+          ip: ip ?? String(rawIp),
+          error: err,
+        });
         return { ...NONE };
       }
     },
@@ -119,7 +148,11 @@ export function createGeoResolver(options: GeoResolverOptions): GeoResolver {
         ip2region.ensureLoaded();
         await maxmind.current();
       } catch (err) {
-        logger.error(`加载数据时出错：${errorMessage(err)}`);
+        logger.error({
+          code: "load_failed",
+          message: `加载数据时出错：${errorMessage(err)}`,
+          error: err,
+        });
       }
       return status();
     },

@@ -76,7 +76,7 @@ npx ip-geo ip2region fetch --dir <应用读的目录> --cache-dir <长期保留�
   `geoipupdate-notify.service` 是自己写的一个 oneshot 服务，`ExecStart` 指向发通知的脚本（脚本里可以用 `journalctl -u geoipupdate.service -n 20 --no-pager` 取最近的输出放进通知）。验证：`systemctl start geoipupdate-notify.service` 手动触发一次
 
 - `ip-geo doctor --maxmind /var/lib/GeoIP` 在数据超过 14 天没更新时打印「⚠️ … 检查定时更新」（`--warn-days` 可调），超过 30 天（`--max-age-days`，与解析器停用的上限相同）或文件缺失、打不开时以 1 退出
-- 应用里可以读解析器的 `status()`：`maxmind.state` 为 `enabled` 时，`city` 与 `asn` 各自是 `ready`（带构建日期）或 `unavailable`（带原因）。应用启动时调一次 `ready()`，状态会写进日志
+- 应用里可以读解析器的 `status()`：`maxmind.state` 为 `enabled` 时，`city` 与 `asn` 各自是 `ready`（带构建日期）或 `unavailable`（带原因代码 `cause` 与说明 `reason`）。应用启动时调一次 `ready()`，状态会写进日志
 
 ### 下线一台机器
 
@@ -91,11 +91,11 @@ npx ip-geo ip2region fetch --dir <应用读的目录> --cache-dir <长期保留�
 
 ## 四、排查
 
-| 现象                                  | 先看                                                                                                                   |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| 港澳台与海外全是 `ip2region-fallback` | 应用有没有传 MaxMind 目录；`status().maxmind.city` 的原因（含「已停用」：超过 30 天没更新）；`ls -l /var/lib/GeoIP`    |
-| 海外的运营商不是 ASN 的组织名         | `status().maxmind.asn` 是否可用                                                                                        |
-| 全部是 `none`                         | ip2region 数据文件在不在应用读的目录里（`ip-geo doctor --ip2region <目录>`）；应用日志里「ip2region 数据文件加载失败」 |
-| 数据版本里是 `ip2region@sha256-…`     | 应用目录里的文件不是包清单那一版，重新 `ip-geo ip2region fetch`                                                        |
-| `geoipupdate` 回 451                  | 见「前提：账户」                                                                                                       |
-| `geoipupdate` 回 401                  | 账户 ID 或许可密钥写错，或密钥已作废                                                                                   |
+| 现象                                  | 先看                                                                                                                    |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| 港澳台与海外全是 `ip2region-fallback` | 应用有没有传 MaxMind 目录；`status().maxmind.city` 的原因（含「已停用」：超过 30 天没更新）；`ls -l /var/lib/GeoIP`     |
+| 海外的运营商不是 ASN 的组织名         | `status().maxmind.asn` 是否可用                                                                                         |
+| 全部是 `none`                         | ip2region 数据文件在不在应用读的目录里（`ip-geo doctor --ip2region <目录>`）；应用日志里的 `ip2region_load_failed` 事件 |
+| 数据版本里是 `ip2region@sha256-…`     | 应用目录里的文件不是包清单那一版，重新 `ip-geo ip2region fetch`                                                         |
+| `geoipupdate` 回 451                  | 见「前提：账户」                                                                                                        |
+| `geoipupdate` 回 401                  | 账户 ID 或许可密钥写错，或密钥已作废                                                                                    |

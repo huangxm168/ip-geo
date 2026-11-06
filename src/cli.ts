@@ -18,6 +18,7 @@ import { Reader } from "maxmind";
 import { fetchIp2region, sha256 } from "./fetch.js";
 import { IP2REGION_FILE, readManifest } from "./manifest.js";
 import { createGeoResolver } from "./resolver.js";
+import type { GeoLogEvent } from "./types.js";
 import { errorMessage } from "./sources/ip2region.js";
 import {
   ASN_FILE,
@@ -169,7 +170,16 @@ async function doctorCommand(args: string[]): Promise<number> {
         ip2regionDir: values.ip2region,
         maxmindDir: values.maxmind,
         maxDataAgeDays: maxAgeDays,
-        logger: { info: () => {}, warn, error: fail },
+        // 命令行查的是使用者自己给的地址，出错时连同异常原文一起打
+        logger: {
+          info: () => {},
+          warn: (event) => {
+            warn(describeEvent(event));
+          },
+          error: (event) => {
+            fail(describeEvent(event));
+          },
+        },
       });
       for (const ip of values.ip) {
         console.log(`${ip} → ${JSON.stringify(await resolver.lookup(ip))}`);
@@ -178,6 +188,17 @@ async function doctorCommand(args: string[]): Promise<number> {
   }
 
   return errors > 0 ? 1 : 0;
+}
+
+function describeEvent(event: GeoLogEvent): string {
+  switch (event.code) {
+    case "lookup_failed":
+      return `${event.message}（${event.ip}）：${errorMessage(event.error)}`;
+    case "maxmind_lookup_failed":
+      return `${event.message}：${errorMessage(event.error)}`;
+    default:
+      return event.message;
+  }
 }
 
 function packageVersion(): string {

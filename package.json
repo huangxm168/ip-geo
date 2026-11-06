@@ -1,6 +1,6 @@
 {
   "name": "@huangxm168/ip-geo",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "IP 地区解析：中国境内用 ip2region，海外与港澳台用 MaxMind GeoLite 补齐城市与运营商 / IP geolocation combining ip2region (China) and MaxMind GeoLite (rest of the world)",
   "keywords": [
     "ip",

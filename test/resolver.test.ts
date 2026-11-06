@@ -7,9 +7,14 @@
 
 import { copyFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
-import { createGeoResolver, type GeoResolver } from "../src/index.js";
+import {
+  createGeoResolver,
+  type GeoLogEvent,
+  type GeoResolver,
+} from "../src/index.js";
+import { Ip2regionSource } from "../src/sources/ip2region.js";
 import { MaxmindSource } from "../src/sources/maxmind.js";
 import {
   ASN_FIXTURE,
@@ -52,6 +57,14 @@ function reasonOf(geo: GeoResolver, edition: "city" | "asn"): string {
   if (maxmind.state !== "enabled") return "";
   const file = maxmind[edition];
   return file.state === "unavailable" ? file.reason : "";
+}
+
+// 某个库不可用的原因代码；可用或没开 MaxMind 时为 null
+function causeOf(geo: GeoResolver, edition: "city" | "asn"): string | null {
+  const maxmind = geo.status().maxmind;
+  if (maxmind.state !== "enabled") return null;
+  const file = maxmind[edition];
+  return file.state === "unavailable" ? file.cause : null;
 }
 
 // 像 geoipupdate 那样先写临时文件再改名
@@ -152,9 +165,15 @@ describe("MaxMind 的状态与降级", () => {
       asn: { state: "unavailable" },
     });
     expect(reasonOf(geo, "city")).toContain("不存在");
-    expect(logger.lines.filter((line) => line.level === "warn")).toHaveLength(
-      1
-    );
+    expect(causeOf(geo, "city")).toBe("missing");
+    expect(causeOf(geo, "asn")).toBe("missing");
+    const warnings = logger.lines.filter((line) => line.level === "warn");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.event).toMatchObject({
+      code: "maxmind_status",
+      city: { state: "unavailable", cause: "missing" },
+      asn: { state: "unavailable", cause: "missing" },
+    });
   });
 
   it("文件类型不对（City 的位置放了 ASN 库）：City 不可用，ASN 照常", async () => {
@@ -171,6 +190,7 @@ describe("MaxMind 的状态与降级", () => {
       asn: { state: "ready" },
     });
     expect(reasonOf(geo, "city")).toContain("不是 City 库");
+    expect(causeOf(geo, "city")).toBe("invalid");
   });
 
   it("只缺 City：地点记降级，ASN 照样补运营商", async () => {
@@ -186,7 +206,9 @@ describe("MaxMind 的状态与降级", () => {
     expect(
       logger.lines.some(
         (line) =>
-          line.level === "warn" && line.message.includes("日后可以补解析")
+          line.level === "warn" &&
+          line.code === "maxmind_status" &&
+          line.message.includes("日后可以补解析")
       )
     ).toBe(true);
   });
@@ -233,11 +255,14 @@ describe("MaxMind 的状态与降级", () => {
       countryCode: "GB",
       source: "ip2region-fallback",
     });
-    expect(
-      logger.lines.some(
-        (line) => line.level === "error" && line.message.includes("模拟的意外")
-      )
-    ).toBe(true);
+    const failed = logger.lines.filter(
+      (line) => line.level === "error" && line.code === "maxmind_lookup_failed"
+    );
+    expect(failed).toHaveLength(1);
+    // 出错的是文件检查、与 IP 无关：事件不带 IP，说明文字也不带异常原文
+    expect(failed[0]?.event).not.toHaveProperty("ip");
+    expect(failed[0]?.message).not.toContain("81.2.69.142");
+    expect(failed[0]?.message).not.toContain("模拟的意外");
   });
 });
 
@@ -255,10 +280,14 @@ describe("过期停用", () => {
     });
     expect(reasonOf(geo, "city")).toContain("已停用");
     expect(reasonOf(geo, "asn")).toContain("已停用");
+    expect(geo.status().maxmind).toMatchObject({
+      city: { cause: "stale", buildDate: "2026-10-22" },
+      asn: { cause: "stale", buildDate: "2026-10-22" },
+    });
     // 同一天里反复检查只报一次
-    expect(logger.lines.filter((line) => line.level === "error")).toHaveLength(
-      1
-    );
+    const errors = logger.lines.filter((line) => line.level === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.code).toBe("maxmind_status");
   });
 
   it("已停用的文件没换就不重读；换成新版后恢复", async () => {
@@ -347,11 +376,17 @@ describe("重载", () => {
     await geo.lookup("81.2.69.142");
     replace(join(dir, "GeoLite2-City.mmdb"), "这不是数据库");
     expect((await geo.lookup("81.2.69.142")).source).toBe("maxmind");
-    expect(
-      logger.lines.some(
-        (line) => line.level === "error" && line.message.includes("继续使用")
-      )
-    ).toBe(true);
+    const rejected = logger.lines.filter(
+      (line) => line.code === "maxmind_file_rejected"
+    );
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.level).toBe("error");
+    expect(rejected[0]?.message).toContain("继续使用");
+    expect(rejected[0]?.event).toMatchObject({
+      edition: "City",
+      path: join(dir, "GeoLite2-City.mmdb"),
+      kept: { databaseType: "GeoLite2-City" },
+    });
   });
 
   it("文件被删了：丢掉旧版、转为降级；放回来后恢复", async () => {
@@ -379,8 +414,10 @@ describe("重载", () => {
     );
     expect(results.every((result) => result.source === "maxmind")).toBe(true);
     expect(
-      logger.lines.filter((line) =>
-        line.message.startsWith("MaxMind City 可用")
+      logger.lines.filter(
+        (line) =>
+          line.code === "maxmind_status" &&
+          line.message.startsWith("MaxMind City 可用")
       )
     ).toHaveLength(1);
   });
@@ -397,9 +434,119 @@ describe("ip2region 不可用", () => {
     });
     expect((await geo.lookup("81.2.69.142")).source).toBe("none");
     expect((await geo.lookup("175.16.199.1")).source).toBe("none");
-    expect(logger.lines.filter((line) => line.level === "error")).toHaveLength(
-      1
-    );
+    const errors = logger.lines.filter((line) => line.level === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.code).toBe("ip2region_load_failed");
+    expect(errors[0]?.event).toMatchObject({
+      path: expect.stringContaining("ip2region_v4.xdb") as unknown,
+    });
     expect(geo.status().ip2region).toBeNull();
+  });
+});
+
+describe("日志里的访客 IP", () => {
+  it("查询出错：IP 只在 ip 字段里，说明文字不带它", async () => {
+    vi.spyOn(Ip2regionSource.prototype, "search").mockRejectedValue(
+      new Error("模拟的意外：175.16.199.1")
+    );
+    const { geo, logger } = resolver(null);
+    expect((await geo.lookup("175.16.199.1")).source).toBe("none");
+    const failed = logger.lines.filter((line) => line.code === "lookup_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.level).toBe("error");
+    expect(failed[0]?.event).toMatchObject({ ip: "175.16.199.1" });
+    expect(failed[0]?.message).not.toContain("175.16.199.1");
+  });
+
+  it("IPv4 映射的 IPv6：ip 字段是规整后的写法，与异常原文里的一致", async () => {
+    vi.spyOn(Ip2regionSource.prototype, "search").mockRejectedValue(
+      new Error("模拟的意外：175.16.199.1")
+    );
+    const { geo, logger } = resolver(null);
+    await geo.lookup("::ffff:175.16.199.1");
+    const failed = logger.lines.filter((line) => line.code === "lookup_failed");
+    expect(failed[0]?.event).toMatchObject({ ip: "175.16.199.1" });
+  });
+
+  it("只有 lookup_failed 带 ip 字段（类型层面）", () => {
+    expectTypeOf<
+      Extract<GeoLogEvent, { ip: string }>["code"]
+    >().toEqualTypeOf<"lookup_failed">();
+  });
+
+  it("缺省打到 console 时不打 IP，也不打异常原文", async () => {
+    vi.spyOn(Ip2regionSource.prototype, "search").mockRejectedValue(
+      new Error("模拟的意外：175.16.199.1")
+    );
+    const printed = vi.spyOn(console, "error").mockImplementation(() => {});
+    const geo = createGeoResolver({ ip2regionDir: IP2REGION_DIR });
+    await geo.lookup("175.16.199.1");
+    const text = printed.mock.calls.flat().map(String).join("\n");
+    expect(text).toContain("[ip-geo]");
+    expect(text).not.toContain("175.16.199.1");
+  });
+
+  it("其余事件都不带 ip 字段", async () => {
+    const dir = maxmindDir();
+    const { geo, logger } = resolver(dir);
+    await geo.ready();
+    await geo.lookup("81.2.69.142");
+    replace(join(dir, "GeoLite2-City.mmdb"), "这不是数据库");
+    await geo.lookup("81.2.69.142");
+    expect(logger.lines.length).toBeGreaterThan(0);
+    for (const line of logger.lines)
+      expect(line.event).not.toHaveProperty("ip");
+  });
+});
+
+describe("logger 自己抛错", () => {
+  const throwing = {
+    info: () => {
+      throw new Error("logger 坏了");
+    },
+    warn: () => {
+      throw new Error("logger 坏了");
+    },
+    error: () => {
+      throw new Error("logger 坏了");
+    },
+  };
+
+  it("查询照常返回，那一条改由 console 打出", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const geo = createGeoResolver({
+      ip2regionDir: IP2REGION_DIR,
+      maxmindDir: maxmindDir(),
+      maxDataAgeDays: null,
+      logger: throwing,
+    });
+    expect((await geo.lookup("81.2.69.142")).source).toBe("maxmind");
+    // ip2region 不会因为「已加载」那一条报错而被当成加载失败
+    expect(geo.status().ip2region).not.toBeNull();
+    const text = info.mock.calls.flat().map(String).join("\n");
+    expect(text).toContain("ip2region 已加载");
+  });
+
+  it("ready 照常返回状态", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const geo = createGeoResolver({
+      ip2regionDir: IP2REGION_DIR,
+      logger: throwing,
+    });
+    await expect(geo.ready()).resolves.toMatchObject({
+      maxmind: { state: "disabled" },
+    });
+  });
+});
+
+describe("status() 交出的是拷贝", () => {
+  it("改了返回值不影响下一次", () => {
+    const { geo } = resolver(maxmindDir());
+    const first = geo.status().maxmind;
+    if (first.state === "enabled" && first.city.state === "unavailable") {
+      first.city.reason = "被改过";
+    }
+    expect(reasonOf(geo, "city")).toBe("尚未加载");
   });
 });
